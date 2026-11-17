@@ -12,3 +12,6 @@ wheels/
 # Model checkpoints and run outputs
 whisper-hi/
 outputs/
+experiments/
+/models/
+/data/

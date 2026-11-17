@@ -1,122 +1,63 @@
+import lightning.pytorch as pl
+from nemo.collections.asr.models import ASRModel
+from nemo.utils.exp_manager import exp_manager
+from omegaconf import DictConfig, OmegaConf
 
-import torch
-from datasets import load_dataset, Audio
-from transformers import WhisperProcessor, WhisperForConditionalGeneration
+from src.adatapers import get_base_model, get_gpu_config
+from src.config import config
+from src.data.dataset import manifest_file, preprocess
+from src.model.model import freeze_parameter
 
-MODEL_ID = "openai/whisper-large-v3-turbo"
+CONFIG_PATH = "speech_to_text_finetune.yml"
 
-# Load dataset
-train = load_dataset(
-    "ai4bharat/Kathbath",
-    "hindi",
-    split="train[:2%]"
-)
 
-valid = load_dataset(
-    "ai4bharat/Kathbath",
-    "hindi",
-    split="valid[:500]"
-)
+def setup_dataloaders(asr_model: ASRModel, cfg: DictConfig) -> ASRModel:
+    """
+    Sets up the training, validation and test dataloaders for the model.
+    Args:
+        asr_model: ASRModel instance
+        cfg: config
+    Returns:
+        asr_model: ASRModel instance with updated dataloaders
+    """
+    asr_model.setup_training_data(cfg.model.train_ds)
+    asr_model.setup_multiple_validation_data(cfg.model.validation_ds)
+    if cfg.model.get("test_ds") is not None and cfg.model.test_ds.manifest_filepath is not None:
+        asr_model.setup_multiple_test_data(cfg.model.test_ds)
 
-# Rename and decode audio at 16 kHz
-train = train.rename_column("audio_filepath", "audio")
-valid = valid.rename_column("audio_filepath", "audio")
+    return asr_model
 
-train = train.cast_column("audio", Audio(sampling_rate=16000))
-valid = valid.cast_column("audio", Audio(sampling_rate=16000))
 
-# Load processor and model
-processor = WhisperProcessor.from_pretrained(
-    MODEL_ID,
-    language="hindi",
-    task="transcribe"
-)
+def main():
+    cfg = OmegaConf.merge(OmegaConf.load(CONFIG_PATH), OmegaConf.from_cli())
+    manifest_file(config.TRAIN_SPLIT, config.TRAIN_SAMPLES, True)
+    manifest_file(config.EVAL_SPLIT, config.EVAL_SAMPLES, False)
+    preprocess()
 
-model = WhisperForConditionalGeneration.from_pretrained(MODEL_ID, dtype=torch.float32)
+    model = get_base_model(config.CONVERTED_MODEL_PATH)
+    freeze_parameter(model)
 
-# No need the cache as of now it can be used for the Inference Script
-model.config.use_cache = False
+    accelerator, devices = get_gpu_config()
+    precision = "16-mixed" if accelerator == "gpu" else 32
+    trainer = pl.Trainer(
+        accelerator=accelerator,
+        devices=devices,
+        precision=precision,
+        **OmegaConf.to_container(cfg.trainer),
+    )
+    exp_manager(trainer, cfg.get("exp_manager", None))
 
-# this is intended to reduce GPU memory consumption
-model.activation_checkpointing_enable()
+    # The optimizer schedule needs the trainer and the training data to know the total steps.
+    model.set_trainer(trainer)
+    model = setup_dataloaders(model, cfg)
+    model.setup_optimization(cfg.model.optim)
 
-# Training all ~800M weights doesn't fit in a T4's 15 GB; train only the decoder
-model.freeze_encoder()
+    if cfg.model.get("spec_augment") is not None:
+        model.spec_augment = ASRModel.from_config_dict(cfg.model.spec_augment)
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model.to(device)
+    trainer.fit(model)
+    model.save_to(f"{config.OUTPUT_DIR}/finetuned_hi.nemo")
 
-# Create optimizer
-optimizer = torch.optim.AdamW(
-    [p for p in model.parameters() if p.requires_grad], lr=1e-5
-)
-scaler = torch.amp.GradScaler("cuda")
 
-# Training configuration
-batch_size = 2
-epochs = 2
-
-model.train()
-
-for epoch in range(epochs):
-
-    total_loss = 0
-
-    for start in range(0, len(train), batch_size):
-
-        # Get only the current batch
-        batch = train[start:start + batch_size]
-
-        audio_batch = batch["audio"]
-        text_batch = batch["text"]
-
-        # Convert audio dictionaries into waveform arrays
-        audio_arrays = [audio["array"] for audio in audio_batch]
-
-        # Convert audio into Whisper input features Encoder
-        input_features = processor.feature_extractor(
-            audio_arrays,
-            sampling_rate=16000,
-            return_tensors="pt"
-        ).input_features.to(device)
-
-        # Convert transcripts into token IDs  ,Decoder
-        tokens = processor.tokenizer(
-            text_batch,
-            padding=True,
-            return_tensors="pt"
-        )
-
-        # Whisper's pad token is also its end-of-text token, so mask by attention_mask
-        labels = tokens.input_ids.masked_fill(tokens.attention_mask.ne(1), -100)
-        # The model prepends the start token itself
-        if (labels[:, 0] == model.config.decoder_start_token_id).all():
-            labels = labels[:, 1:]
-        labels = labels.to(device)
-
-        # Train on this batch
-        optimizer.zero_grad()
-
-        with torch.autocast("cuda", dtype=torch.float16):
-            outputs = model(
-                input_features=input_features,
-                labels=labels
-            )
-
-        loss = outputs.loss
-        scaler.scale(loss).backward()
-        scaler.step(optimizer)
-        scaler.update()
-
-        total_loss += loss.item()
-
-        step = start // batch_size
-        if step % 100 == 0:
-            print(f"Epoch {epoch + 1}, step {step}, loss {loss.item():.4f}", flush=True)
-
-    average_loss = total_loss / ((len(train) + batch_size - 1) // batch_size)
-
-    print(f"Epoch {epoch + 1}, Average Loss: {average_loss:.4f}")
-
-    model.save_pretrained(f"whisper-hi/epoch-{epoch + 1}")
-    processor.save_pretrained(f"whisper-hi/epoch-{epoch + 1}")
+if __name__ == "__main__":
+    main()

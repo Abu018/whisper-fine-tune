@@ -1,24 +1,26 @@
 [project]
 name = "poc"
 version = "0.1.0"
-description = "Add your description here"
+description = "Fine-tune AI4Bharat's Hindi IndicConformer (NeMo) on Kathbath"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "accelerate>=1.15.0",
     "datasets>=5.2.0",
-    "evaluate>=0.4.6",
+    "huggingface-hub>=2.4.0",
     "jiwer>=4.0.0",
-    "librosa>=1.0.1",
+    "lightning>=2.4.0",
+    "nemo-toolkit[asr]>=3.0.0",
+    "omegaconf>=2.3.0",
     "soundfile>=0.14.0",
     "torch>=2.15.0",
     "torchcodec>=0.17.0",
-    "transformers>=5.23.0",
 ]
 
-[project.scripts]
-poc = "poc:main"
+[dependency-groups]
+dev = [
+    "ruff>=0.17.5",
+]
 
-[build-system]
-requires = ["uv_build>=0.13.8,<0.14.0"]
-build-backend = "uv_build"
+[tool.ruff]
+line-length = 100
+target-version = "py312"
